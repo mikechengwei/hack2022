@@ -3,60 +3,70 @@ package main
 import (
 	"context"
 	"fmt"
-	"gitee.com/knullhhf/hack22/logger"
-	mnet "gitee.com/knullhhf/hack22/net"
-	"gitee.com/knullhhf/hack22/net/msg"
+	"github.com/knullhhf/hack22/logger"
+	mnet "github.com/knullhhf/hack22/net"
+	"github.com/knullhhf/hack22/net/msg"
+	"github.com/knullhhf/hack22/net/storage"
+	"github.com/pingcap/tidb/dumpling/export"
+	"go.uber.org/zap"
 	"net"
+	"os"
 	"sync"
-	"sync/atomic"
-	"time"
 )
 
-type taskService struct {
-	msg.UnimplementedTaskManagerServer
-	cli      *msg.ClientInfo
-	taskAddr string
-	tasks    map[string]*cliTask
-	wg       *sync.WaitGroup
-	ctx      context.Context
+type TaskServiceInterface interface {
+	NewTask(ctx context.Context, in *msg.ReqNewTask) (*msg.ReplyNewTask, error)
+	StartTask(ctx context.Context, in *msg.ReqNewTask) (*msg.ReplyNewTask, error)
+	ReportState(ctx context.Context, in *msg.ReqReport) (*msg.ReplyReport, error)
 }
 
-// func (ts *taskService) mustEmbedUnimplementedTaskManagerServer() {
-// 	// TODO implement me
-// 	panic("implement me")
-// }
+type TaskService struct {
+	msg.UnimplementedTaskManagerServer
+	cli          *msg.ClientInfo
+	tasks        map[string]*cliTask
+	writeSignals map[string]*sync.WaitGroup
+	wg           *sync.WaitGroup
+	ctx          context.Context
+}
 
-func (ts *taskService) NewTask(ctx context.Context, in *msg.ReqNewTask) (*msg.ReplyNewTask, error) {
+func (ts *TaskService) NewTask(ctx context.Context, in *msg.ReqNewTask) (*msg.ReplyNewTask, error) {
 	logger.LogTraceJson("NewTask %s", in)
-	// TODO : cli check;
 
-	// task check.
-	tc, err := net.Dial("tcp", in.GetTaskAddr())
+	tc, err := net.Dial("tcp", in.GetServer().GetTaskAddress())
 	if err != nil {
-		return nil, fmt.Errorf("dial '%s' err:%s", in.GetTaskAddr(), err.Error())
+		return nil, fmt.Errorf("dial '%s' err:%s", in.GetCli().GetAddress(), err.Error())
 	}
 
-	k := mnet.SocketKey(in.Cli.Name, in.Task.TaskName, in.Task.TaskKey)
+	k := mnet.SocketKey(in.Cli.Name, in.Task.Key)
 	_, err = tc.Write([]byte(k))
 	if err != nil {
 		return nil, fmt.Errorf("write err:%w", err)
 	}
+
 	logger.LogTrace("write key '%s'", k)
 	ct := cliTask{
-		name:  in.Task.TaskName,
+		name:  in.Task.Name,
 		con:   tc,
 		info:  *in.Task,
 		state: msg.TaskState_ts_Create,
 	}
 	ts.tasks[ct.name] = &ct
 	//
-	ts.wg.Add(1)
-	go ts.DumpData(&ct)
+	ts.writeSignals[in.Task.Name] = &sync.WaitGroup{}
+	ts.writeSignals[in.Task.Name].Add(1)
+	go ts.DumpTableData(&ct)
 	return &msg.ReplyNewTask{Rc: mnet.DefaultOkReplay()}, nil
 }
 
-func (ts *taskService) ReportState(ctx context.Context, in *msg.ReqReport) (*msg.ReplyReport, error) {
-	t := ts.tasks[in.GetTask().GetTaskName()]
+// StartTask start write data
+func (ts *TaskService) StartTask(ctx context.Context, in *msg.ReqNewTask) (*msg.ReplyNewTask, error) {
+	logger.LogTraceJson("StartTask %s", in)
+	ts.writeSignals[in.Task.Name].Done()
+	return &msg.ReplyNewTask{Rc: mnet.DefaultOkReplay()}, nil
+}
+
+func (ts *TaskService) ReportState(ctx context.Context, in *msg.ReqReport) (*msg.ReplyReport, error) {
+	t := ts.tasks[in.GetTask().GetName()]
 
 	rr := msg.ReplyReport{
 		Rc:       mnet.DefaultOkReplay(),
@@ -66,18 +76,42 @@ func (ts *taskService) ReportState(ctx context.Context, in *msg.ReqReport) (*msg
 	return &rr, nil
 }
 
-func (cc *taskService) DumpData(task *cliTask) {
-	logger.LogInfo("DumpData(%s) running....", task.name)
-	defer cc.wg.Done()
-	// select from source data;
-	// dump data to
-
-	// TODO : set state here. just for test this;
-	task.state = msg.TaskState_ts_Dumpling
-	var idx int64
-	for {
-		time.Sleep(time.Second)
-		task.progress = fmt.Sprintf("%d", atomic.AddInt64(&idx, 1))
-		task.con.Write([]byte(fmt.Sprintf("run - %d.\n", idx)))
+func (cc *TaskService) DumpTableData(task *cliTask) {
+	logger.LogInfo("DumpData(%s) waiting write signals....", task.name)
+	cc.writeSignals[task.name].Wait()
+	conf := export.DefaultConfig()
+	logger.LogInfo("DumpData(%s) start write ....", task.name)
+	extStorage := &storage.SocketStorage{
+		Writer: &storage.SocketStorageWriter{
+			Connection: task.con,
+		},
 	}
+	conf.User = task.info.Source.Username
+	conf.Password = task.info.Source.Password
+	conf.Port = int(task.info.Source.Port)
+	conf.Host = task.info.Source.Host
+	conf.SQL = fmt.Sprintf("select * from `%s`.`%s`", task.info.Source.Db, task.info.Source.Tbl)
+	conf.FileType = "csv"
+	conf.ExtStorage = extStorage
+	conf.CsvSeparator = ","
+	conf.CsvDelimiter = "\""
+	conf.StatementSize = 2000000
+	conf.FileSize = 1024 * 1024 * 1024 //need to justify
+	ctx := context.TODO()
+	dumper, err := export.NewDumper(ctx, conf)
+	if err != nil {
+		fmt.Printf("\ncreate dumper failed: %s\n", err.Error())
+		os.Exit(1)
+	}
+	err = dumper.Dump()
+	//time.Sleep(60 * time.Second)
+	task.con.Close()
+	if err != nil {
+		dumper.L().Error("dump failed error stack info", zap.Error(err))
+		fmt.Printf("\ndump failed: %s\n", err.Error())
+		os.Exit(1)
+	}
+
+	logger.LogInfo("close connection success")
+
 }
